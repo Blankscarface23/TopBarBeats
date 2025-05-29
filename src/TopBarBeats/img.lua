@@ -1,0 +1,10 @@
+return {
+	-- eighth note, by default --
+	APP_ICON = 88806340921490,
+
+	-- Controls --
+	REWIND = 119448019109241,
+	PLAY = 81056247791416,
+	PAUSE = 135980986376480,
+	FASTFORWARD = 76681498363656,
+}
