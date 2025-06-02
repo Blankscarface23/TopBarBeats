@@ -287,6 +287,17 @@ function TopBarBeats:toggleMusic(isEnabled: boolean, needsRestart: boolean?)
 
 		if TopBarBeats.TrackTitleIcon then
 			TopBarBeats.TrackTitleIcon:setLabel(name)
+
+			-- Autoscale according to the name size; NOT handled automatically by TopBarPlus --
+			-- Buttons were clipping out if names were too long --
+			if TopBarBeats["RootNode"] then
+				task.delay(0.1, function()
+					TopBarBeats.RootNode:deselect()
+					task.delay(0.1, function()
+						TopBarBeats.RootNode:select()
+					end)
+				end)
+			end
 		end
 
 		if needsRestart then
