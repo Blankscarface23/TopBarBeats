@@ -291,9 +291,13 @@ function TopBarBeats:toggleMusic(isEnabled: boolean, needsRestart: boolean?)
 			-- Autoscale according to the name size; NOT handled automatically by TopBarPlus --
 			-- Buttons were clipping out if names were too long --
 			if TopBarBeats["RootNode"] then
+				local isOpened = TopBarBeats.RootNode["isSelected"]
 				task.delay(0.1, function()
 					TopBarBeats.RootNode:deselect()
 					task.delay(0.1, function()
+						if not isOpened then
+							return
+						end
 						TopBarBeats.RootNode:select()
 					end)
 				end)
