@@ -3,7 +3,7 @@
 --[[
   TopBarBeats Music Player (Extension of TopBarPlus https://1foreverhd.github.io/TopbarPlus/)
   Published under the MIT License.
-  © 5/28/2025 Blankscarface23 😎✨
+  © 5/28/2025 Blankscarface23
 
   Permission is hereby granted, free of charge, to any person obtaining a copy
   of this software and associated documentation files (the "Software"), to deal
@@ -28,6 +28,7 @@ local TopBarBeats = {}
 
 -- Types --
 type Track = { name: string, id: string }
+export type RepeatMode = "All" | "One" | "Off"
 
 -- Services --
 local SoundService = game:GetService("SoundService")
@@ -45,9 +46,21 @@ TopBarBeats.TrackList = {} :: { Track }
 TopBarBeats.CurrentTrack = nil :: Sound?
 TopBarBeats.CurrentTrackIndex = 1 :: number
 
+-- Volume --
+TopBarBeats.Volume = 0.5 :: number
+TopBarBeats.VolumeStep = 0.1 :: number
+TopBarBeats.IsMuted = false :: boolean
+TopBarBeats._preMuteVolume = 0.5 :: number
+
+-- Repeat mode --
+TopBarBeats.RepeatMode = "All" :: RepeatMode
+
+-- Connection tracking for cleanup --
+TopBarBeats._connections = {} :: { RBXScriptConnection }
+
 -- Helper Modules --
 local img = require(script.img)
-local attribute = require(script.attribution)
+local _attribute = require(script.attribution)
 
 -- Helper Functions --
 
@@ -114,61 +127,126 @@ local function shuffleTable(t: { any }): { any }
 	return shuffled
 end
 
+--[=[
+	@function applyVolume
+	@within TopBarBeats
+
+	Applies the current volume to the SoundGroup.
+]=]
+local function applyVolume()
+	local soundGroup = SoundService:FindFirstChild("TopBarBeats") :: SoundGroup?
+	if soundGroup then
+		soundGroup.Volume = TopBarBeats.IsMuted and 0 or TopBarBeats.Volume
+	end
+end
+
 -- TopBarBeats API --
 
 --[=[
 	@function loadTracks
 	@within TopBarBeats
 	@param playlist {[number]: string}
-	@param config {[string]: boolean}?
+	@param config {[string]: any}?
 	@return nil
-	
+
 	Loads the requested track ids.
-	config options: autostart, shuffle
-	config is NOT required 
-	
+	config options: autostart, shuffle, volume
+	config is NOT required
+
 	Format for playlist is as follows:
 	TopBarBeats:loadTracks(
 		{"rbxassetid://132839662402626", "rbxassetid://131065621936266", ...},
-		{ autostart = true, shuffle = true }
+		{ autostart = true, shuffle = true, volume = 0.5 }
 	)
 ]=]
-function TopBarBeats:loadTracks(playlist: { [number]: string }, config: { [string]: boolean }?)
+function TopBarBeats:loadTracks(playlist: { [number]: string }, config: { [string]: any }?)
 	self.TrackList = {} -- reset on each load
-	for _, trackId in pairs(playlist) do
+	self.CurrentTrackIndex = 1
+
+	for _, trackId in ipairs(playlist) do
 		-- Make sure trackId has correct prefix (optional auto-fix)
 		if not trackId:match("^rbxassetid://") then
 			trackId = "rbxassetid://" .. trackId
 		end
 
 		-- Validate trackId format strictly
-		validateSoundId(trackId)
+		local validOk, validErr = pcall(validateSoundId, trackId)
+		if not validOk then
+			warn(`TopBarBeats: Skipping invalid track - {validErr}`)
+			continue
+		end
 
 		local name = getTrackName(trackId)
 		if not name then
-			warn(`Issue loading track: {trackId}`)
-			return
+			warn(`TopBarBeats: Skipping track (could not fetch name): {trackId}`)
+			continue
 		end
 
 		table.insert(self.TrackList, { name = name, id = trackId })
 	end
 
+	if #self.TrackList == 0 then
+		warn("TopBarBeats: No valid tracks were loaded.")
+		return
+	end
+
 	if config and next(config) then
+		if config.volume then
+			self.Volume = math.clamp(config.volume :: number, 0, 1)
+			applyVolume()
+		end
 		if config.shuffle then
-			TopBarBeats.TrackList = shuffleTable(TopBarBeats.TrackList)
+			self.TrackList = shuffleTable(self.TrackList)
 		end
 		if config.autostart then
-			TopBarBeats:toggleMusic(true)
+			self:toggleMusic(true, true)
 		end
 	end
+end
+
+--[=[
+	@function setVolume
+	@within TopBarBeats
+	@param volume number -- 0 to 1
+	@return nil
+
+	Sets the playback volume.
+]=]
+function TopBarBeats:setVolume(volume: number)
+	self.Volume = math.clamp(volume, 0, 1)
+	self.IsMuted = false
+	applyVolume()
+end
+
+--[=[
+	@function getVolume
+	@within TopBarBeats
+	@return number
+
+	Returns the current volume (0 to 1).
+]=]
+function TopBarBeats:getVolume(): number
+	return self.Volume
+end
+
+--[=[
+	@function setRepeatMode
+	@within TopBarBeats
+	@param mode RepeatMode -- "All", "One", or "Off"
+	@return nil
+
+	Sets the repeat mode.
+]=]
+function TopBarBeats:setRepeatMode(mode: RepeatMode)
+	self.RepeatMode = mode
 end
 
 --[=[
 	@function setupControls
 	@within TopBarBeats
 	@return nil
-	
-	Loads the requested track ids.
+
+	Sets up the TopBarPlus controls and menu.
 ]=]
 function TopBarBeats:setupControls()
 	local function attemptSetup()
@@ -178,62 +256,73 @@ function TopBarBeats:setupControls()
 
 		local TopBarIcon = TopBarBeats.TopBarPlus
 
+		-- Rewind: restart if >5s in, otherwise previous track --
 		local function rewindMusic()
-			if TopBarBeats.CurrentTrack and TopBarBeats.TrackList and TopBarBeats.CurrentTrackIndex then
-				-- Restart Current Song if listening longer than five seconds --
-				if TopBarBeats.CurrentTrack.TimePosition > 5 then
-					TopBarBeats:toggleMusic(true, true)
-					return
-				end
+			if not TopBarBeats.CurrentTrack or #TopBarBeats.TrackList == 0 then return end
 
-				if TopBarBeats.CurrentTrackIndex == 1 then
-					TopBarBeats.CurrentTrackIndex = #TopBarBeats.TrackList
-				else
-					TopBarBeats.CurrentTrackIndex -= 1
-				end
-
+			if TopBarBeats.CurrentTrack.TimePosition > 5 then
 				TopBarBeats:toggleMusic(true, true)
+				return
 			end
+
+			if TopBarBeats.CurrentTrackIndex <= 1 then
+				TopBarBeats.CurrentTrackIndex = #TopBarBeats.TrackList
+			else
+				TopBarBeats.CurrentTrackIndex -= 1
+			end
+
+			TopBarBeats:toggleMusic(true, true)
 		end
 
+		-- Fast forward: next track --
 		local function fastForwardMusic()
-			if TopBarBeats.CurrentTrack and TopBarBeats.TrackList and TopBarBeats.CurrentTrackIndex then
-				if TopBarBeats.CurrentTrackIndex == #TopBarBeats.TrackList then
-					TopBarBeats.CurrentTrackIndex = 1
-				else
-					TopBarBeats.CurrentTrackIndex += 1
-				end
+			if not TopBarBeats.CurrentTrack or #TopBarBeats.TrackList == 0 then return end
 
-				TopBarBeats:toggleMusic(true, true)
+			if TopBarBeats.CurrentTrackIndex >= #TopBarBeats.TrackList then
+				TopBarBeats.CurrentTrackIndex = 1
+			else
+				TopBarBeats.CurrentTrackIndex += 1
 			end
+
+			TopBarBeats:toggleMusic(true, true)
 		end
 
+		-- Track Title (display only) --
 		local trackTitleIcon = TopBarIcon.new()
-			:setName("Made with 💖 by Blankscarface23")
-			:setLabel("TopBarBeats! 😎")
+			:setName("Made with love by Blankscarface23")
+			:setLabel("TopBarBeats!")
 			:lock()
 			:oneClick()
 		TopBarBeats.TrackTitleIcon = trackTitleIcon
 
-		local rewindButton =
-			TopBarIcon.new():setImage(img.REWIND):setCaption("Rewind"):bindEvent("selected", rewindMusic):oneClick()
-		local pausePlayButton = TopBarIcon.new():setImage(img.PLAY):setCaption("Play"):oneClick()
+		-- Rewind --
+		local rewindButton = TopBarIcon.new()
+			:setImage(img.REWIND)
+			:setCaption("Rewind")
+			:bindEvent("selected", rewindMusic)
+			:oneClick()
 
+		-- Play/Pause --
+		local pausePlayButton = TopBarIcon.new()
+			:setImage(img.PLAY)
+			:setCaption("Play")
+			:oneClick()
 		TopBarBeats.PausePlayButton = pausePlayButton
 
 		local function handlePausePlay()
-			if TopBarBeats.isPlaying then
-				pausePlayButton:setImage(img.PLAY)
-				pausePlayButton:setCaption("Play")
-			else
+			local willPlay = not TopBarBeats.isPlaying
+			if willPlay then
 				pausePlayButton:setImage(img.PAUSE)
 				pausePlayButton:setCaption("Pause")
+			else
+				pausePlayButton:setImage(img.PLAY)
+				pausePlayButton:setCaption("Play")
 			end
-			TopBarBeats:toggleMusic(not TopBarBeats.isPlaying)
+			TopBarBeats:toggleMusic(willPlay)
 		end
-
 		pausePlayButton:bindEvent("selected", handlePausePlay)
 
+		-- Fast Forward --
 		local fastForwardButton = TopBarIcon.new()
 			:setImage(img.FASTFORWARD)
 			:setCaption("Fast Forward")
@@ -264,14 +353,18 @@ end
 	@param isEnabled boolean
 	@param needsRestart boolean?
 	@return nil
-	
-	Loads TopBarBeats into TopBarPlus.
+
+	Plays or pauses the current track.
 ]=]
 function TopBarBeats:toggleMusic(isEnabled: boolean, needsRestart: boolean?)
-	-- Safely turn off/on TopBarBeats tracks --
 	local function tryToggle()
 		if not TopBarBeats.CurrentTrack then
 			error("Unable to play Track - Did you initialize TopBarBeats with TopBarBeats:init()?")
+		end
+
+		if #TopBarBeats.TrackList == 0 then
+			warn("TopBarBeats: No tracks loaded.")
+			return true
 		end
 
 		if not isEnabled then
@@ -280,36 +373,29 @@ function TopBarBeats:toggleMusic(isEnabled: boolean, needsRestart: boolean?)
 		end
 
 		local trackInfo = TopBarBeats.TrackList[TopBarBeats.CurrentTrackIndex]
-		local name, id = trackInfo.name, trackInfo.id
+		if not trackInfo then
+			warn("TopBarBeats: Invalid track index.")
+			return true
+		end
 
-		-- Validate again before playback
+		local name, id = trackInfo.name, trackInfo.id
 		validateSoundId(id)
 
+		-- Update track title label --
 		if TopBarBeats.TrackTitleIcon then
 			TopBarBeats.TrackTitleIcon:setLabel(name)
-
-			-- Autoscale according to the name size; NOT handled automatically by TopBarPlus --
-			-- Buttons were clipping out if names were too long --
-			if TopBarBeats["RootNode"] then
-				local isOpened = TopBarBeats.RootNode["isSelected"]
-				task.delay(0.1, function()
-					TopBarBeats.RootNode:deselect()
-					task.delay(0.1, function()
-						if not isOpened then
-							return
-						end
-						TopBarBeats.RootNode:select()
-					end)
-				end)
-			end
 		end
 
-		if needsRestart then
-			TopBarBeats.CurrentTrack.TimePosition = 0
-		end
-
+		-- Handle track switching or restart --
+		local isNewTrack = TopBarBeats.CurrentTrack.SoundId ~= id
 		TopBarBeats.CurrentTrack.SoundId = id
-		TopBarBeats.CurrentTrack:Resume()
+
+		if needsRestart or isNewTrack then
+			TopBarBeats.CurrentTrack.TimePosition = 0
+			TopBarBeats.CurrentTrack:Play()
+		else
+			TopBarBeats.CurrentTrack:Resume()
+		end
 
 		return true
 	end
@@ -324,12 +410,12 @@ function TopBarBeats:toggleMusic(isEnabled: boolean, needsRestart: boolean?)
 end
 
 --[=[
-	@function setupControls
+	@function init
 	@within TopBarBeats
 	@param TopBarPlus any
 	@return nil
-	
-	Loads TopBarBeats into TopBarPlus.
+
+	Initializes TopBarBeats with a TopBarPlus reference.
 ]=]
 function TopBarBeats:init(TopBarPlus: any)
 	if not TopBarPlus or typeof(TopBarPlus) ~= "table" then
@@ -340,59 +426,88 @@ function TopBarBeats:init(TopBarPlus: any)
 	TopBarBeats.TopBarPlus = TopBarPlus
 
 	-- Create SoundGroup and Sound --
-	if not SoundService:FindFirstChild("TopBarBeats") then
-		local TopBarBeatsSoundGroup = Instance.new("SoundGroup")
+	local soundGroup = SoundService:FindFirstChild("TopBarBeats") :: SoundGroup?
+	if not soundGroup then
+		local newGroup = Instance.new("SoundGroup")
+		newGroup.Name = "TopBarBeats"
+		newGroup.Volume = TopBarBeats.Volume
+		newGroup.Parent = SoundService
+		soundGroup = newGroup
+	end
 
-		TopBarBeatsSoundGroup.Name = "TopBarBeats"
-		TopBarBeatsSoundGroup.Parent = SoundService
-
-		if not TopBarBeatsSoundGroup:FindFirstChild("Sound") then
-			TopBarBeats.CurrentTrack = Instance.new("Sound") :: Sound
-
-			if TopBarBeats.CurrentTrack then
-				TopBarBeats.CurrentTrack.Name = "TopBarTrack"
-				TopBarBeats.CurrentTrack.Parent = TopBarBeatsSoundGroup
-			end
-		end
+	if soundGroup and not soundGroup:FindFirstChild("TopBarTrack") then
+		local sound = Instance.new("Sound") :: Sound
+		sound.Name = "TopBarTrack"
+		sound.SoundGroup = soundGroup
+		sound.Parent = soundGroup
+		TopBarBeats.CurrentTrack = sound
+	elseif soundGroup then
+		TopBarBeats.CurrentTrack = soundGroup:FindFirstChild("TopBarTrack") :: Sound?
 	end
 
 	TopBarBeats:setupControls()
 
 	-- Register Track Events --
-	if TopBarBeats.CurrentTrack and TopBarBeats.TrackList and TopBarBeats.CurrentTrackIndex then
-		-- Move to next track cyclically --
+	if TopBarBeats.CurrentTrack then
+		-- Advance to the next track based on repeat mode --
 		local function handleTrackEnded()
-			if TopBarBeats.CurrentTrackIndex == #TopBarBeats.TrackList then
-				TopBarBeats.CurrentTrackIndex = 1
-			else
-				TopBarBeats.CurrentTrackIndex += 1
-			end
+			if #TopBarBeats.TrackList == 0 then return end
 
-			TopBarBeats:toggleMusic(true)
+			if TopBarBeats.RepeatMode == "One" then
+				-- Replay the same track
+				TopBarBeats:toggleMusic(true, true)
+			elseif TopBarBeats.RepeatMode == "All" then
+				-- Advance cyclically
+				if TopBarBeats.CurrentTrackIndex >= #TopBarBeats.TrackList then
+					TopBarBeats.CurrentTrackIndex = 1
+				else
+					TopBarBeats.CurrentTrackIndex += 1
+				end
+				TopBarBeats:toggleMusic(true, true)
+			elseif TopBarBeats.RepeatMode == "Off" then
+				-- Advance but stop at the end of the playlist
+				if TopBarBeats.CurrentTrackIndex < #TopBarBeats.TrackList then
+					TopBarBeats.CurrentTrackIndex += 1
+					TopBarBeats:toggleMusic(true, true)
+				else
+					-- End of playlist; stop playing
+					TopBarBeats.isPlaying = false
+					if TopBarBeats.PausePlayButton then
+						TopBarBeats.PausePlayButton:setImage(img.PLAY)
+						TopBarBeats.PausePlayButton:setCaption("Play")
+					end
+				end
+			end
 		end
 
-		-- Make sure PausePlay button exists; set image, as requested --
 		local function setPlayingImage(image: number)
-			if not image or not TopBarBeats.PausePlayButton then
-				return
-			end
-
+			if not image or not TopBarBeats.PausePlayButton then return end
 			TopBarBeats.PausePlayButton:setImage(image)
 		end
 
-		TopBarBeats.CurrentTrack.Ended:Connect(handleTrackEnded)
-		TopBarBeats.CurrentTrack.Paused:Connect(function()
+		-- Store connections for cleanup --
+		table.insert(TopBarBeats._connections, TopBarBeats.CurrentTrack.Ended:Connect(handleTrackEnded))
+		table.insert(TopBarBeats._connections, TopBarBeats.CurrentTrack.Paused:Connect(function()
 			TopBarBeats.isPlaying = false
 			setPlayingImage(img.PLAY)
-		end)
-		TopBarBeats.CurrentTrack.Resumed:Connect(function()
+			if TopBarBeats.PausePlayButton then
+				TopBarBeats.PausePlayButton:setCaption("Play")
+			end
+		end))
+		table.insert(TopBarBeats._connections, TopBarBeats.CurrentTrack.Resumed:Connect(function()
 			TopBarBeats.isPlaying = true
 			setPlayingImage(img.PAUSE)
-		end)
-		TopBarBeats.CurrentTrack.Played:Connect(function()
+			if TopBarBeats.PausePlayButton then
+				TopBarBeats.PausePlayButton:setCaption("Pause")
+			end
+		end))
+		table.insert(TopBarBeats._connections, TopBarBeats.CurrentTrack.Played:Connect(function()
 			TopBarBeats.isPlaying = true
 			setPlayingImage(img.PAUSE)
-		end)
+			if TopBarBeats.PausePlayButton then
+				TopBarBeats.PausePlayButton:setCaption("Pause")
+			end
+		end))
 	end
 end
 
@@ -400,49 +515,63 @@ end
 	@function getIcon
 	@within TopBarBeats
 	@return any?
-	
+
 	Returns TopBarBeats Root node.
 ]=]
 function TopBarBeats:getIcon(): any?
-	return TopBarBeats["RootNode"]
+	return self.RootNode
 end
 
 --[=[
 	@function destroy
 	@within TopBarBeats
 	@return nil
-	
-	Destroys TopBarBeats, along with references...
+
+	Destroys TopBarBeats, cleaning up all references and connections.
 ]=]
 function TopBarBeats:destroy()
-	-- Stop and destroy the current playing sound
+	-- Disconnect all event connections --
+	for _, connection in ipairs(self._connections) do
+		if connection and connection.Connected then
+			connection:Disconnect()
+		end
+	end
+	table.clear(self._connections)
+
+	-- Stop and destroy the current playing sound --
 	if self.CurrentTrack then
 		self.CurrentTrack:Stop()
 		self.CurrentTrack:Destroy()
+		self.CurrentTrack = nil
 	end
 
-	-- Clear the track list and reset index
+	-- Clear the track list and reset state --
 	self.TrackList = {}
 	self.CurrentTrackIndex = 1
 	self.isPlaying = false
+	self.Volume = 0.5
+	self.IsMuted = false
 
-	-- Destroy UI elements if they exist
+	-- Destroy UI elements --
 	if self.RootNode then
 		self.RootNode:destroy()
+		self.RootNode = nil
 	end
 
 	if self.TrackTitleIcon then
 		self.TrackTitleIcon:destroy()
+		self.TrackTitleIcon = nil
 	end
 
 	if self.PausePlayButton then
 		self.PausePlayButton:destroy()
+		self.PausePlayButton = nil
 	end
 
-	-- Clear TopBarPlus reference
+	-- Clear TopBarPlus reference --
 	self.TopBarPlus = nil
 
-	-- Optional: Remove the SoundGroup if you created it
+	-- Remove the SoundGroup --
 	local soundGroup = SoundService:FindFirstChild("TopBarBeats")
 	if soundGroup then
 		soundGroup:Destroy()
